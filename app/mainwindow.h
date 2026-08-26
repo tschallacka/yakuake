@@ -120,6 +120,8 @@ private Q_SLOTS:
 
     void wmActiveWindowChanged();
 
+    void handleActiveWindowChanged(QWindow *focusWindow);
+
     void xshapeOpenWindow();
     void xshapeRetractWindow();
 
@@ -161,6 +163,9 @@ private:
 #endif
 
     void xshapeToggleWindowState(bool visible);
+
+    void enterRetractedState();
+    void leaveRetractedState();
 
     void sharedPreOpenWindow();
     void sharedAfterOpenWindow();
@@ -210,6 +215,11 @@ private:
 
     bool m_isX11;
     bool m_isWayland;
+
+    // Retracted while still mapped, so the task switcher can reach the window;
+    // m_retractedRect holds the geometry to restore on open.
+    bool m_retracted;
+    QRect m_retractedRect;
 
     void initWayland();
     void initWaylandSurface();

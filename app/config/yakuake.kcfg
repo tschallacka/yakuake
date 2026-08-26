@@ -93,6 +93,11 @@
       <whatsthis context="@info:whatsthis">Whether the window will be shown fullscreen again when it has been previously.</whatsthis>
     <default>false</default>
     </entry>
+    <entry name="OpenOnAltTab" type="Bool">
+      <label context="@label">Open window when selected via the task switcher</label>
+      <whatsthis context="@info:whatsthis">Whether to open the application window when it is brought to the foreground with the task switcher (e.g. Alt+Tab) while it is currently retracted.</whatsthis>
+      <default>false</default>
+    </entry>
   </group>
   <group name="Appearance">
     <entry name="Skin" type="String">

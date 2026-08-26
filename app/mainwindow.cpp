@@ -93,6 +93,7 @@ MainWindow::MainWindow(QWidget *parent)
     initWayland();
 
     m_toggleLock = false;
+    m_retracted = false;
 
     m_outputOrderWatcher = OutputOrderWatcher::instance(this);
 
@@ -123,6 +124,8 @@ MainWindow::MainWindow(QWidget *parent)
     if (KWindowSystem::isPlatformX11()) {
         connect(KX11Extras::self(), &KX11Extras::workAreaChanged, this, &MainWindow::applyWindowGeometry);
     }
+
+    connect(qGuiApp, &QGuiApplication::focusWindowChanged, this, &MainWindow::handleActiveWindowChanged);
 
     connect(m_outputOrderWatcher, &OutputOrderWatcher::outputOrderChanged, this, &MainWindow::updateScreenMenu);
 
@@ -176,7 +179,10 @@ void MainWindow::initWayland()
 void MainWindow::initWaylandSurface()
 {
     if (m_plasmaShellSurface) {
-        m_plasmaShellSurface->setPosition(pos());
+        // Leave a retracted window where it was parked; it is repositioned on open.
+        if (!m_retracted) {
+            m_plasmaShellSurface->setPosition(pos());
+        }
         return;
     }
     if (!m_plasmaShell) {
@@ -186,7 +192,7 @@ void MainWindow::initWaylandSurface()
         m_plasmaShellSurface = m_plasmaShell->createSurface(surface, this);
         m_plasmaShellSurface->setPosition(pos());
         m_plasmaShellSurface->setSkipTaskbar(true);
-        m_plasmaShellSurface->setSkipSwitcher(true);
+        m_plasmaShellSurface->setSkipSwitcher(!Settings::openOnAltTab());
     }
 }
 
@@ -988,6 +994,8 @@ void MainWindow::applySkin()
 
 void MainWindow::applyWindowProperties()
 {
+    const bool openOnAltTab = Settings::openOnAltTab();
+
     if (m_isX11) {
         if (Settings::keepOpen() && !Settings::keepAbove()) {
             KX11Extras::clearState(winId(), NET::KeepAbove);
@@ -995,12 +1003,17 @@ void MainWindow::applyWindowProperties()
         } else {
             KX11Extras::setState(winId(), NET::KeepAbove | NET::SkipTaskbar | NET::SkipPager);
         }
+        if (openOnAltTab) {
+            KX11Extras::clearState(winId(), NET::SkipSwitcher);
+        } else {
+            KX11Extras::setState(winId(), NET::SkipSwitcher);
+        }
         KX11Extras::setOnAllDesktops(winId(), Settings::showOnAllDesktops());
     }
 
     if (m_isWayland && m_plasmaShellSurface) {
         m_plasmaShellSurface->setSkipTaskbar(true);
-        m_plasmaShellSurface->setSkipSwitcher(true);
+        m_plasmaShellSurface->setSkipSwitcher(!openOnAltTab);
     }
 
     winId(); // make sure windowHandle() is created
@@ -1211,9 +1224,22 @@ void MainWindow::wmActiveWindowChanged()
         return;
     }
 
-    if (!Settings::keepOpen() && isVisible() && !isActiveWindow()) {
+    if (!Settings::keepOpen() && isVisible() && !m_retracted && !isActiveWindow()) {
         toggleWindowState();
     }
+}
+
+void MainWindow::handleActiveWindowChanged(QWindow *focusWindow)
+{
+    if (!Settings::openOnAltTab()) {
+        return;
+    }
+
+    if (focusWindow != windowHandle() || (isVisible() && !m_retracted)) {
+        return;
+    }
+
+    toggleWindowState();
 }
 
 void MainWindow::changeEvent(QEvent *event)
@@ -1248,7 +1274,10 @@ void MainWindow::toggleWindowState()
         QObject::connect(watcher, &QDBusPendingCallWatcher::finished, this, [=, this]() {
             QDBusPendingReply<QRect> reply = *watcher;
             m_availableScreenRect = reply.isValid() ? reply.value() : QRect();
-            setWindowGeometry(Settings::width(), Settings::height(), Settings::position());
+            // Applying the configured geometry now would undo the retraction.
+            if (!m_retracted) {
+                setWindowGeometry(Settings::width(), Settings::height(), Settings::position());
+            }
             watcher->deleteLater();
         });
 
@@ -1260,7 +1289,7 @@ void MainWindow::toggleWindowState()
 
 void MainWindow::_toggleWindowState()
 {
-    bool visible = isVisible();
+    bool visible = isVisible() && !m_retracted;
 
     if (visible && !isActiveWindow() && Settings::keepOpen()) {
         // Window is open but doesn't have focus; it's set to stay open
@@ -1316,18 +1345,27 @@ void MainWindow::_toggleWindowState()
         if (visible) {
             sharedPreHideWindow();
 
-            hide();
+            enterRetractedState();
 
             sharedAfterHideWindow();
         } else {
+            leaveRetractedState();
+
             sharedPreOpenWindow();
             if (!m_isWayland) {
                 slideWindow();
             }
 
             show();
+
             if (m_isWayland) {
                 slideWindow();
+
+                // A window that was only retracted is already mapped, so showing it
+                // does not hand it focus; ask for it and swallow the resulting focus
+                // change so it isn't read as a reason to retract again.
+                m_toggleLock = true;
+                KWindowSystem::activateWindow(windowHandle());
             }
 
             sharedAfterOpenWindow();
@@ -1378,10 +1416,12 @@ void MainWindow::kwinAssistToggleWindowState(bool visible)
         if (visible) {
             sharedPreHideWindow();
 
-            hide();
+            enterRetractedState();
 
             sharedAfterHideWindow();
         } else {
+            leaveRetractedState();
+
             sharedPreOpenWindow();
 
             show();
@@ -1434,6 +1474,8 @@ void MainWindow::xshapeToggleWindowState(bool visible)
 void MainWindow::xshapeOpenWindow()
 {
     if (m_animationFrame == 0) {
+        leaveRetractedState();
+
         sharedPreOpenWindow();
 
         show();
@@ -1467,7 +1509,7 @@ void MainWindow::xshapeRetractWindow()
         m_animationTimer.stop();
         m_animationTimer.disconnect();
 
-        hide();
+        enterRetractedState();
 
         sharedAfterHideWindow();
     } else {
@@ -1475,6 +1517,43 @@ void MainWindow::xshapeRetractWindow()
         setMask(QRegion(mask()).translated(0, -m_animationStepSize));
 
         --m_animationFrame;
+    }
+}
+
+void MainWindow::enterRetractedState()
+{
+    if (!Settings::openOnAltTab()) {
+        hide();
+        return;
+    }
+
+    // The task switcher cannot offer a hidden window, so keep it mapped and move it
+    // out of sight instead: shrunk to a single line on Wayland, fully masked on X11.
+    m_retracted = true;
+
+    if (m_isWayland) {
+        m_retractedRect = geometry();
+
+        if (m_plasmaShellSurface) {
+            m_plasmaShellSurface->setPosition(QPoint(m_retractedRect.x(), m_retractedRect.y() - 1));
+        }
+
+        windowHandle()->setGeometry(QRect(m_retractedRect.x(), m_retractedRect.y(), m_retractedRect.width(), 1));
+    } else {
+        setMask(QRect());
+    }
+}
+
+void MainWindow::leaveRetractedState()
+{
+    if (!m_retracted) {
+        return;
+    }
+
+    m_retracted = false;
+
+    if (m_retractedRect.isValid()) {
+        windowHandle()->setGeometry(m_retractedRect);
     }
 }
 
@@ -1518,8 +1597,11 @@ void MainWindow::sharedAfterHideWindow()
     if (Settings::pollMouse())
         toggleMousePoll(true);
 
-    delete m_plasmaShellSurface;
-    m_plasmaShellSurface = nullptr;
+    // A retracted window is still mapped, so it needs to keep its surface.
+    if (!m_retracted) {
+        delete m_plasmaShellSurface;
+        m_plasmaShellSurface = nullptr;
+    }
 
     Q_EMIT windowClosed();
 }
