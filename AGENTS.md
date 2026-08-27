@@ -85,3 +85,44 @@ then restart `plasma-kglobalaccel.service`.
 - Smoke-test a build without touching the real profile by pointing
   `XDG_CONFIG_HOME` and `XDG_DATA_HOME` at a throwaway directory:
   `XDG_CONFIG_HOME=/tmp/x/cfg XDG_DATA_HOME=/tmp/x/data result/bin/yakuake --version`
+
+### If it still starts the packaged build
+
+Editing `Exec=` in `org.kde.yakuake.desktop` does **nothing**. The entry sets
+`DBusActivatable=true`, so launching goes through D-Bus activation and the
+binary is chosen by the `.service` file, not the `.desktop`. Two places have to
+be corrected, and neither is the one you would reach for first.
+
+**1. The session bus has not re-read the override.** `dbus-daemon` cannot watch
+a directory that did not exist when the session started, so the freshly created
+`/usr/local/share/dbus-1/services/` is invisible until told:
+
+```bash
+dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+  / org.freedesktop.DBus.ReloadConfig
+```
+
+Only needed once, for the session in which the install happened — at next login
+the bus scans `XDG_DATA_DIRS`, where `/usr/local/share` already leads.
+
+**2. The autostart unit has the old path baked in.** The XDG autostart entry
+ships `Exec=yakuake`, which `systemd-xdg-autostart-generator` resolves to an
+absolute path *at generation time*, producing
+`ExecStart=:/usr/bin/yakuake`. Make it explicit:
+
+```bash
+sed -i 's|^Exec=yakuake$|Exec=/usr/local/bin/yakuake|' \
+  ~/.config/autostart/org.kde.yakuake.desktop
+systemctl --user daemon-reload
+```
+
+Verify with `systemctl --user cat app-org.kde.yakuake@autostart.service`.
+
+**Checking which binary is actually live.** `pgrep -x yakuake` finds nothing —
+the nix wrapper execs `.yakuake-wrapped`, so `comm` is `.yakuake-wrappe`. Follow
+the exe link instead:
+
+```bash
+ps -eo pid,comm,args --no-headers | awk '/yakuake/'
+readlink -f /proc/<pid>/exe   # must land in /nix/store/...-yakuake-26.11.70
+```
